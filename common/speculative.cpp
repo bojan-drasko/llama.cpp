@@ -397,11 +397,6 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
     std::vector<int32_t> i_batch_beg;
     std::vector<int32_t> i_batch_end;
 
-    // Hidden rows from the most recent target verification batch, grouped by seq.
-    // Row 0 corresponds to the sampled token, row N to the Nth accepted draft token.
-    std::vector<std::vector<float>> verify_h;
-    std::vector<int32_t> verify_h_rows;
-
     // Per-seq draft length from the last draft() call, used in accept() to
     // roll back ctx_dft's recurrent state past the AR draft's redundant
     // pre-advancement before process() mirrored the verify batch.
@@ -439,9 +434,6 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
 
         i_batch_beg.assign(n_seq, -1);
         i_batch_end.assign(n_seq, -1);
-
-        verify_h.assign(n_seq, {});
-        verify_h_rows.assign(n_seq, 0);
 
         last_n_drafted.assign(n_seq, 0);
     }
@@ -548,22 +540,14 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
             return false;
         }
 
+        // Lazy single-row D2H: read just the last row for pending_h default
+        // accept() will override this with the actual accepted position if called
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_end[seq_id] < 0) {
                 continue;
             }
-
-            const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
-            verify_h_rows[seq_id] = n_rows;
-            verify_h[seq_id].resize((size_t) n_rows * n_embd);
-
-            for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_pre_norm_ith(ctx_tgt, i_batch_beg[seq_id] + i);
-                std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
-            }
-
-            std::memcpy(pending_h[seq_id].data(),
-                    verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+            const float * h = llama_get_embeddings_pre_norm_ith(ctx_tgt, i_batch_end[seq_id]);
+            std::memcpy(pending_h[seq_id].data(), h, row_bytes);
         }
 
         return true;
@@ -683,14 +667,21 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
             return;
         }
 
-        const int32_t n_rows = verify_h_rows[seq_id];
+        if (i_batch_beg[seq_id] < 0 || i_batch_end[seq_id] < 0) {
+            return;
+        }
+
+        const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
         if (n_rows <= 0) {
             return;
         }
 
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
-        std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+
+        // Single-row lazy D2H: read just the one row we need from GPU
+        const float * h = llama_get_embeddings_pre_norm_ith(params.ctx_tgt, i_batch_beg[seq_id] + i_h);
+        std::memcpy(pending_h[seq_id].data(), h, row_bytes);
     }
 
     bool need_embd() const override {
