@@ -3436,6 +3436,9 @@ llama_context * llama_init_from_model(
         return nullptr;
     }
 
+    if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    }
 
     try {
         auto * ctx = new llama_context(*model, params);
